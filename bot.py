@@ -10,6 +10,7 @@ Telegram Bot for Claude Code CLI
 """
 
 import subprocess
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -41,6 +42,16 @@ CLAUDE_CONFIG = {
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 CONVERSATION_FILE = DATA_DIR / "conversation.json"
+
+# 文件上传目录
+UPLOAD_DIR = DATA_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+# 流式响应配置
+STREAM_CONFIG = {
+    "update_interval": 1.5,    # 更新间隔（秒）- Telegram 有频率限制
+    "min_change_len": 50,      # 最小变化长度才触发更新
+}
 
 # ============ 会话管理 ============
 def load_conversation() -> dict:
@@ -329,6 +340,88 @@ def call_claude(prompt: str, use_context: bool = True) -> str:
 
     return "❌ 多次重试后仍然失败"
 
+async def call_claude_stream(prompt: str, use_context: bool = True, callback=None) -> str:
+    """
+    异步调用 Claude CLI（流式输出）
+
+    优化：
+    1. 实时读取输出
+    2. 定期回调更新消息
+    3. 更好的用户体验
+    """
+    # 构建完整 prompt（带上下文）
+    if use_context:
+        context = get_context_prompt()
+        if context:
+            full_prompt = f"上下文：\n{context}\n\n问题：{prompt}"
+        else:
+            full_prompt = prompt
+    else:
+        full_prompt = prompt
+
+    # 调用 claude CLI (yolo 模式：跳过权限检查)
+    cmd = ["claude", "-p", full_prompt, "--output-format", "text", "--dangerously-skip-permissions"]
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(Path.home())
+        )
+
+        output_lines = []
+        last_update = asyncio.get_event_loop().time()
+        last_output = ""
+
+        # 逐行读取输出
+        while True:
+            line = await asyncio.wait_for(
+                process.stdout.readline(),
+                timeout=CLAUDE_CONFIG["timeout"]
+            )
+
+            if not line:
+                break
+
+            decoded_line = line.decode("utf-8", errors="replace")
+            output_lines.append(decoded_line)
+            current_output = "".join(output_lines).strip()
+
+            # 定期回调更新消息
+            now = asyncio.get_event_loop().time()
+            if callback and (now - last_update) >= STREAM_CONFIG["update_interval"]:
+                if len(current_output) - len(last_output) >= STREAM_CONFIG["min_change_len"]:
+                    try:
+                        await callback(current_output + " ▌")
+                        last_output = current_output
+                        last_update = now
+                    except Exception:
+                        pass  # 忽略更新失败
+
+        # 等待进程结束
+        await process.wait()
+
+        final_output = "".join(output_lines).strip()
+
+        if process.returncode != 0:
+            stderr = await process.stderr.read()
+            return f"❌ Claude 错误:\n{stderr.decode('utf-8', errors='replace')}"
+
+        return final_output
+
+    except asyncio.TimeoutError:
+        return "⏰ 请求超时，Claude 处理时间过长，请稍后重试"
+    except FileNotFoundError:
+        return "❌ 未找到 claude 命令，请确认已安装 Claude Code CLI"
+    except Exception as e:
+        return f"❌ 错误: {str(e)}"
+
+def download_file(file_path: str, dest_path: Path) -> Path:
+    """下载文件到指定目录"""
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    return dest_path
+
 # ============ Telegram Handlers ============
 async def check_auth(update: Update) -> bool:
     """检查是否是授权用户"""
@@ -433,7 +526,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理普通消息（优化版）"""
+    """处理普通消息（流式输出版）"""
     if not await check_auth(update):
         return
 
@@ -445,13 +538,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 保存用户消息
     add_message("user", user_message)
 
-    # 调用 Claude（带重试）
-    response = call_claude(user_message, use_context=True)
+    # 定义流式更新回调
+    async def stream_callback(partial_output: str):
+        try:
+            # 截断过长的消息（Telegram 限制 4096）
+            if len(partial_output) > 4000:
+                partial_output = partial_output[:4000] + "..."
+            await thinking_msg.edit_text(partial_output)
+        except Exception:
+            pass  # 忽略编辑失败（可能是内容没变化）
+
+    # 调用 Claude（流式输出）
+    response = await call_claude_stream(user_message, use_context=True, callback=stream_callback)
 
     # 保存 Claude 回复
     add_message("assistant", response)
 
-    # 删除"正在思考"消息，发送回复
+    # 删除"正在思考"消息，发送最终回复
     try:
         await thinking_msg.delete()
     except Exception:
@@ -464,6 +567,118 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chunks = [response[i:i+4096] for i in range(0, len(response), 4096)]
         for chunk in chunks:
             await update.message.reply_text(chunk)
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理上传的文档"""
+    if not await check_auth(update):
+        return
+
+    document = update.message.document
+    file_name = document.file_name or "unknown_file"
+    file_size = document.file_size
+
+    # 检查文件大小（限制 20MB）
+    if file_size > 20 * 1024 * 1024:
+        await update.message.reply_text("❌ 文件太大，最大支持 20MB")
+        return
+
+    # 发送处理提示
+    status_msg = await update.message.reply_text(f"📥 正在下载文件: {file_name}...")
+
+    try:
+        # 下载文件
+        file = await document.get_file()
+        file_path = UPLOAD_DIR / file_name
+        await file.download_to_drive(file_path)
+
+        await status_msg.edit_text(f"🔍 正在分析文件: {file_name}...")
+
+        # 构建分析提示
+        prompt = f"请分析这个文件的内容和结构：{file_path}"
+
+        # 定义流式更新回调
+        async def stream_callback(partial_output: str):
+            try:
+                display_text = f"🔍 分析 {file_name}：\n\n{partial_output}"
+                if len(display_text) > 4000:
+                    display_text = display_text[:4000] + "..."
+                await status_msg.edit_text(display_text)
+            except Exception:
+                pass
+
+        # 调用 Claude 分析
+        response = await call_claude_stream(prompt, use_context=False, callback=stream_callback)
+
+        # 删除状态消息，发送结果
+        await status_msg.delete()
+
+        # 发送分析结果
+        result_text = f"📄 文件分析: {file_name}\n\n{response}"
+        if len(result_text) <= 4096:
+            await update.message.reply_text(result_text)
+        else:
+            await update.message.reply_text(f"📄 文件分析: {file_name}")
+            chunks = [response[i:i+4096] for i in range(0, len(response), 4096)]
+            for chunk in chunks:
+                await update.message.reply_text(chunk)
+
+    except Exception as e:
+        await status_msg.edit_text(f"❌ 文件处理失败: {str(e)}")
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理上传的图片"""
+    if not await check_auth(update):
+        return
+
+    # 获取最高分辨率的图片
+    photo = update.message.photo[-1]
+    caption = update.message.caption or ""
+
+    # 发送处理提示
+    status_msg = await update.message.reply_text("🖼️ 正在下载图片...")
+
+    try:
+        # 下载图片
+        file = await photo.get_file()
+        file_path = UPLOAD_DIR / f"photo_{photo.file_unique_id}.jpg"
+        await file.download_to_drive(file_path)
+
+        await status_msg.edit_text("🔍 正在分析图片...")
+
+        # 构建分析提示
+        if caption:
+            prompt = f"请分析这张图片：{file_path}\n\n用户说明：{caption}"
+        else:
+            prompt = f"请详细描述和分析这张图片的内容：{file_path}"
+
+        # 定义流式更新回调
+        async def stream_callback(partial_output: str):
+            try:
+                display_text = f"🖼️ 图片分析：\n\n{partial_output}"
+                if len(display_text) > 4000:
+                    display_text = display_text[:4000] + "..."
+                await status_msg.edit_text(display_text)
+            except Exception:
+                pass
+
+        # 调用 Claude 分析
+        response = await call_claude_stream(prompt, use_context=False, callback=stream_callback)
+
+        # 删除状态消息，发送结果
+        await status_msg.delete()
+
+        # 发送分析结果
+        result_text = f"🖼️ 图片分析\n\n{response}"
+        if len(result_text) <= 4096:
+            await update.message.reply_text(result_text)
+        else:
+            await update.message.reply_text("🖼️ 图片分析")
+            chunks = [response[i:i+4096] for i in range(0, len(response), 4096)]
+            for chunk in chunks:
+                await update.message.reply_text(chunk)
+
+    except Exception as e:
+        await status_msg.edit_text(f"❌ 图片处理失败: {str(e)}")
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理错误"""
@@ -489,6 +704,8 @@ def main():
 
     # 添加消息处理器
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     # 添加错误处理器
     app.add_error_handler(error_handler)
