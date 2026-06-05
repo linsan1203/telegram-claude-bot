@@ -958,9 +958,13 @@ def main():
     app.add_error_handler(error_handler)
 
     # 启动 LingTai 轮询任务
-    if LINGTAI_CONFIG["enabled"]:
-        print("🔄 启动 LingTai 轮询任务...")
-        app.post_init = lambda app: asyncio.create_task(lingtai_poll_task(app))
+    async def post_init(app: Application):
+        """启动后初始化"""
+        if LINGTAI_CONFIG["enabled"]:
+            print("🔄 启动 LingTai 轮询任务...")
+            asyncio.create_task(lingtai_poll_task(app))
+
+    app.post_init = post_init
 
     # 启动轮询
     print("✅ Bot 已启动，等待消息...")
