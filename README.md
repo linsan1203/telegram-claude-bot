@@ -18,6 +18,7 @@
 - ✅ **流式响应** - 实时显示 Claude 输出（打字机效果）
 - ✅ **文件上传分析** - 支持上传文档让 Claude 分析
 - ✅ **图片识别** - 支持上传图片让 Claude 描述和分析
+- ✅ **LingTai 集成** - Agent 间通信，自动转发消息到 Telegram
 
 ---
 
@@ -113,6 +114,8 @@ kill <PID>
 | `/clear` | 清除对话历史 |
 | `/context` | 查看当前上下文状态 |
 | `/stats` | 查看会话统计信息 |
+| `/inbox` | 查看 LingTai 收件箱 |
+| `/send` | 发送 LingTai 消息 |
 
 ## 📎 支持的消息类型
 
@@ -121,6 +124,26 @@ kill <PID>
 | 文本消息 | 直接与 Claude 对话（流式输出） |
 | 文档上传 | 上传文件让 Claude 分析内容 |
 | 图片上传 | 上传图片让 Claude 描述分析（可添加说明文字） |
+
+## 🔗 LingTai 集成
+
+Bot 集成了 LingTai Agent 网络，支持：
+
+- **自动转发**：定期检查 LingTai 收件箱，新消息自动转发到 Telegram
+- **手动查看**：使用 `/inbox` 命令查看待处理消息
+- **发送消息**：使用 `/send` 命令向 Agent 发送消息
+
+### 配置
+
+在 `bot.py` 中配置 LingTai：
+
+```python
+LINGTAI_CONFIG = {
+    "enabled": True,                          # 是否启用
+    "human_mailbox": Path.home() / ".lingtai" / "human" / "mailbox",
+    "check_interval": 30,                     # 检查间隔（秒）
+}
+```
 
 ---
 
@@ -601,6 +624,12 @@ def init_db():
 ---
 
 ## 🔄 版本历史
+
+### v1.2.0 (2026-06-05)
+- ✅ LingTai 集成 - Agent 间通信
+- ✅ 自动转发 - LingTai 消息自动转发到 Telegram
+- ✅ /inbox 命令 - 查看 LingTai 收件箱
+- ✅ /send 命令 - 发送 LingTai 消息
 
 ### v1.1.0 (2026-06-05)
 - ✅ 流式响应 - 实时显示 Claude 输出
