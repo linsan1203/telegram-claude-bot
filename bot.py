@@ -546,6 +546,13 @@ def send_lingtai_message(to: list, subject: str, message: str) -> bool:
         print(f"❌ 发送 LingTai 消息失败: {e}")
         return False
 
+def escape_markdown(text: str) -> str:
+    """转义 Markdown 特殊字符"""
+    special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    for char in special_chars:
+        text = text.replace(char, f'\\{char}')
+    return text
+
 def format_lingtai_message(msg: dict) -> str:
     """格式化 LingTai 消息用于显示"""
     sender = msg.get("from", "unknown")
@@ -557,7 +564,12 @@ def format_lingtai_message(msg: dict) -> str:
     if len(content) > 500:
         content = content[:500] + "..."
 
-    return f"📬 *新消息来自 {sender}*\n\n📋 *{subject}*\n\n{content}\n\n⏰ {received_at[:19]}"
+    # 转义 Markdown 特殊字符
+    sender_safe = escape_markdown(sender)
+    subject_safe = escape_markdown(subject)
+    content_safe = escape_markdown(content)
+
+    return f"📬 *新消息来自 {sender_safe}*\n\n📋 *{subject_safe}*\n\n{content_safe}\n\n⏰ {received_at[:19]}"
 
 async def lingtai_poll_task(application: Application):
     """LingTai 轮询任务"""
@@ -576,17 +588,29 @@ async def lingtai_poll_task(application: Application):
             if messages:
                 print(f"📬 发现 {len(messages)} 条新消息")
 
+                sent_count = 0
                 for msg in messages:
                     try:
                         # 格式化消息
                         formatted = format_lingtai_message(msg)
 
-                        # 发送到 Telegram
-                        await application.bot.send_message(
-                            chat_id=ALLOWED_USER_ID,
-                            text=formatted,
-                            parse_mode="Markdown"
-                        )
+                        # 发送到 Telegram（带重试）
+                        max_retries = 3
+                        for retry in range(max_retries):
+                            try:
+                                await application.bot.send_message(
+                                    chat_id=ALLOWED_USER_ID,
+                                    text=formatted,
+                                    parse_mode="Markdown"
+                                )
+                                sent_count += 1
+                                break
+                            except Exception as e:
+                                if retry < max_retries - 1:
+                                    print(f"⚠️ 发送失败，重试 {retry + 1}/{max_retries}: {e}")
+                                    await asyncio.sleep(2)
+                                else:
+                                    raise e
 
                         # 标记为已处理
                         LINGTAI_STATE["processed_ids"].add(msg["id"])
@@ -596,6 +620,9 @@ async def lingtai_poll_task(application: Application):
 
                     except Exception as e:
                         print(f"❌ 发送消息到 Telegram 失败: {e}")
+
+                if sent_count > 0:
+                    print(f"✅ 成功发送 {sent_count}/{len(messages)} 条消息到 Telegram")
 
         except asyncio.CancelledError:
             print("🔄 LingTai 轮询任务已停止")
@@ -938,8 +965,10 @@ def main():
     print(f"📁 数据目录: {DATA_DIR}")
     print(f"⚙️ 上下文配置: {CONTEXT_CONFIG}")
 
-    # 创建 Application
-    app = Application.builder().token(BOT_TOKEN).build()
+    # 创建 Application（配置代理）
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest(proxy="http://127.0.0.1:7897")
+    app = Application.builder().token(BOT_TOKEN).request(request).build()
 
     # 添加命令处理器
     app.add_handler(CommandHandler("start", start_command))
