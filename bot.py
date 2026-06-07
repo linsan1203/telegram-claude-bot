@@ -53,20 +53,6 @@ STREAM_CONFIG = {
     "min_change_len": 50,      # 最小变化长度才触发更新
 }
 
-# LingTai 配置
-LINGTAI_CONFIG = {
-    "enabled": True,                          # 是否启用 LingTai 集成
-    "human_mailbox": Path.home() / ".lingtai" / "human" / "mailbox",
-    "check_interval": 30,                     # 检查间隔（秒）
-    "last_read_file": Path.home() / ".lingtai" / "human" / ".last_read_claude_bot",
-}
-
-# LingTai 状态
-LINGTAI_STATE = {
-    "last_check": None,
-    "processed_ids": set(),  # 已处理的消息 ID
-}
-
 # ============ 会话管理 ============
 def load_conversation() -> dict:
     """
@@ -436,200 +422,6 @@ def download_file(file_path: str, dest_path: Path) -> Path:
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     return dest_path
 
-# ============ LingTai 集成 ============
-
-def get_last_read_time() -> str:
-    """获取上次读取时间"""
-    try:
-        if LINGTAI_CONFIG["last_read_file"].exists():
-            return LINGTAI_CONFIG["last_read_file"].read_text().strip()
-    except Exception:
-        pass
-    return ""
-
-def set_last_read_time(timestamp: str):
-    """设置上次读取时间"""
-    try:
-        LINGTAI_CONFIG["last_read_file"].write_text(timestamp)
-    except Exception as e:
-        print(f"⚠️ 保存读取时间失败: {e}")
-
-def check_lingtai_inbox() -> list:
-    """检查 LingTai 收件箱"""
-    messages = []
-    inbox_dir = LINGTAI_CONFIG["human_mailbox"] / "inbox"
-
-    if not inbox_dir.exists():
-        return messages
-
-    last_read = get_last_read_time()
-
-    try:
-        for msg_dir in sorted(inbox_dir.iterdir()):
-            if not msg_dir.is_dir():
-                continue
-
-            msg_file = msg_dir / "message.json"
-            if not msg_file.exists():
-                continue
-
-            try:
-                with open(msg_file, "r", encoding="utf-8") as f:
-                    msg = json.load(f)
-
-                msg_id = msg.get("id", "")
-                received_at = msg.get("received_at", "")
-
-                # 跳过已处理的消息
-                if msg_id in LINGTAI_STATE["processed_ids"]:
-                    continue
-
-                # 跳过旧消息
-                if last_read and received_at <= last_read:
-                    continue
-
-                messages.append({
-                    "id": msg_id,
-                    "from": msg.get("from", "unknown"),
-                    "subject": msg.get("subject", "无主题"),
-                    "message": msg.get("message", ""),
-                    "received_at": received_at,
-                    "dir_name": msg_dir.name,
-                })
-
-            except Exception as e:
-                print(f"⚠️ 解析消息失败 {msg_file}: {e}")
-
-    except Exception as e:
-        print(f"⚠️ 检查收件箱失败: {e}")
-
-    return messages
-
-def send_lingtai_message(to: list, subject: str, message: str) -> bool:
-    """发送 LingTai 消息"""
-    try:
-        import uuid
-        from datetime import datetime, timezone
-
-        msg_id = str(uuid.uuid4())
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        outbox_dir = LINGTAI_CONFIG["human_mailbox"] / "outbox" / msg_id
-        outbox_dir.mkdir(parents=True, exist_ok=True)
-
-        msg_data = {
-            "id": msg_id,
-            "_mailbox_id": msg_id,
-            "from": "human",
-            "to": to,
-            "cc": [],
-            "subject": subject,
-            "message": message,
-            "type": "normal",
-            "received_at": timestamp,
-            "attachments": [],
-            "identity": {
-                "agent_name": "human",
-                "admin": None,
-                "via": "claude-bot"
-            }
-        }
-
-        msg_file = outbox_dir / "message.json"
-        with open(msg_file, "w", encoding="utf-8") as f:
-            json.dump(msg_data, f, ensure_ascii=False, indent=2)
-
-        print(f"✅ LingTai 消息已发送: {msg_id}")
-        return True
-
-    except Exception as e:
-        print(f"❌ 发送 LingTai 消息失败: {e}")
-        return False
-
-def escape_markdown(text: str) -> str:
-    """转义 Markdown 特殊字符"""
-    special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
-    for char in special_chars:
-        text = text.replace(char, f'\\{char}')
-    return text
-
-def format_lingtai_message(msg: dict) -> str:
-    """格式化 LingTai 消息用于显示"""
-    sender = msg.get("from", "unknown")
-    subject = msg.get("subject", "无主题")
-    content = msg.get("message", "")
-    received_at = msg.get("received_at", "")
-
-    # 截断过长的内容
-    if len(content) > 500:
-        content = content[:500] + "..."
-
-    # 转义 Markdown 特殊字符
-    sender_safe = escape_markdown(sender)
-    subject_safe = escape_markdown(subject)
-    content_safe = escape_markdown(content)
-
-    return f"📬 *新消息来自 {sender_safe}*\n\n📋 *{subject_safe}*\n\n{content_safe}\n\n⏰ {received_at[:19]}"
-
-async def lingtai_poll_task(application: Application):
-    """LingTai 轮询任务"""
-    if not LINGTAI_CONFIG["enabled"]:
-        return
-
-    print("🔄 LingTai 轮询任务已启动")
-
-    while True:
-        try:
-            await asyncio.sleep(LINGTAI_CONFIG["check_interval"])
-
-            # 检查收件箱
-            messages = check_lingtai_inbox()
-
-            if messages:
-                print(f"📬 发现 {len(messages)} 条新消息")
-
-                sent_count = 0
-                for msg in messages:
-                    try:
-                        # 格式化消息
-                        formatted = format_lingtai_message(msg)
-
-                        # 发送到 Telegram（带重试）
-                        max_retries = 3
-                        for retry in range(max_retries):
-                            try:
-                                await application.bot.send_message(
-                                    chat_id=ALLOWED_USER_ID,
-                                    text=formatted,
-                                    parse_mode="Markdown"
-                                )
-                                sent_count += 1
-                                break
-                            except Exception as e:
-                                if retry < max_retries - 1:
-                                    print(f"⚠️ 发送失败，重试 {retry + 1}/{max_retries}: {e}")
-                                    await asyncio.sleep(2)
-                                else:
-                                    raise e
-
-                        # 标记为已处理
-                        LINGTAI_STATE["processed_ids"].add(msg["id"])
-
-                        # 更新最后读取时间
-                        set_last_read_time(msg["received_at"])
-
-                    except Exception as e:
-                        print(f"❌ 发送消息到 Telegram 失败: {e}")
-
-                if sent_count > 0:
-                    print(f"✅ 成功发送 {sent_count}/{len(messages)} 条消息到 Telegram")
-
-        except asyncio.CancelledError:
-            print("🔄 LingTai 轮询任务已停止")
-            break
-        except Exception as e:
-            print(f"❌ LingTai 轮询错误: {e}")
-
 # ============ Telegram Handlers ============
 async def check_auth(update: Update) -> bool:
     """检查是否是授权用户"""
@@ -651,7 +443,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • 编写代码
 • 分析文件
 • 执行命令
-• LingTai Agent 通信
 
 直接发消息给我就行！
 
@@ -659,13 +450,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /start - 显示帮助
 /clear - 清除对话历史
 /context - 查看当前上下文
-/stats - 查看会话统计
-/inbox - 查看 LingTai 收件箱
-/send - 发送 LingTai 消息
-
-LingTai 集成：
-• 自动转发 Agent 消息到 Telegram
-• 支持回复 Agent 消息"""
+/stats - 查看会话统计"""
 
     await update.message.reply_text(welcome)
 
@@ -739,63 +524,6 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • 上下文限制：{CLAUDE_CONFIG['context_max_chars']} 字符"""
 
     await update.message.reply_text(text)
-
-async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """查看 LingTai 收件箱"""
-    if not await check_auth(update):
-        return
-
-    messages = check_lingtai_inbox()
-
-    if not messages:
-        await update.message.reply_text("📭 LingTai 收件箱为空")
-        return
-
-    text = f"📬 *LingTai 收件箱* ({len(messages)} 条新消息)\n\n"
-
-    for msg in messages[-10:]:  # 只显示最近 10 条
-        sender = msg.get("from", "unknown")
-        subject = msg.get("subject", "无主题")
-        received_at = msg.get("received_at", "")[:19]
-        text += f"• *{sender}*: {subject}\n  ⏰ {received_at}\n\n"
-
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """发送 LingTai 消息"""
-    if not await check_auth(update):
-        return
-
-    # 解析命令参数
-    args = context.args
-    if len(args) < 3:
-        await update.message.reply_text(
-            "📝 用法: /send <收件人> <主题> <内容>\n\n"
-            "示例: /send hermes 测试消息 你好，请回复",
-            parse_mode="Markdown"
-        )
-        return
-
-    recipient = args[0]
-    subject = args[1]
-    message = " ".join(args[2:])
-
-    # 发送消息
-    success = send_lingtai_message(
-        to=[recipient],
-        subject=subject,
-        message=message
-    )
-
-    if success:
-        await update.message.reply_text(
-            f"✅ 消息已发送给 *{recipient}*\n\n"
-            f"📋 主题: {subject}\n"
-            f"📝 内容: {message[:100]}{'...' if len(message) > 100 else ''}",
-            parse_mode="Markdown"
-        )
-    else:
-        await update.message.reply_text("❌ 发送消息失败")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理普通消息（流式输出版）"""
@@ -975,8 +703,6 @@ def main():
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("context", context_command))
     app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("inbox", inbox_command))
-    app.add_handler(CommandHandler("send", send_command))
 
     # 添加消息处理器
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -985,15 +711,6 @@ def main():
 
     # 添加错误处理器
     app.add_error_handler(error_handler)
-
-    # 启动 LingTai 轮询任务
-    async def post_init(app: Application):
-        """启动后初始化"""
-        if LINGTAI_CONFIG["enabled"]:
-            print("🔄 启动 LingTai 轮询任务...")
-            asyncio.create_task(lingtai_poll_task(app))
-
-    app.post_init = post_init
 
     # 启动轮询
     print("✅ Bot 已启动，等待消息...")
