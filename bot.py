@@ -13,10 +13,20 @@ import subprocess
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+
+# 添加 AgentMQ 路径
+sys.path.insert(0, str(Path.home() / "agent-mq"))
+try:
+    from agent_mq import AgentMQ
+    AGENT_MQ_AVAILABLE = True
+except ImportError:
+    AGENT_MQ_AVAILABLE = False
+    print("⚠️ AgentMQ 未安装，Agent 间通信功能不可用")
 
 # ============ 配置 ============
 BOT_TOKEN = "8703978277:AAEUTrYqz-Vys22i-c8chGbovNSM-WaIhLE"
@@ -52,6 +62,15 @@ STREAM_CONFIG = {
     "update_interval": 1.5,    # 更新间隔（秒）- Telegram 有频率限制
     "min_change_len": 50,      # 最小变化长度才触发更新
 }
+
+# AgentMQ 配置
+AGENT_MQ = None
+if AGENT_MQ_AVAILABLE:
+    try:
+        AGENT_MQ = AgentMQ("claude-bot")
+        print("✅ AgentMQ 已初始化")
+    except Exception as e:
+        print(f"⚠️ AgentMQ 初始化失败: {e}")
 
 # ============ 会话管理 ============
 def load_conversation() -> dict:
@@ -443,6 +462,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • 编写代码
 • 分析文件
 • 执行命令
+• Agent 间通信
 
 直接发消息给我就行！
 
@@ -450,7 +470,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /start - 显示帮助
 /clear - 清除对话历史
 /context - 查看当前上下文
-/stats - 查看会话统计"""
+/stats - 查看会话统计
+
+AgentMQ 命令:
+/mq - 查看 AgentMQ 状态
+/mqcheck - 检查新消息
+/mqsend - 发送消息给其他 Agent"""
 
     await update.message.reply_text(welcome)
 
@@ -524,6 +549,93 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • 上下文限制：{CLAUDE_CONFIG['context_max_chars']} 字符"""
 
     await update.message.reply_text(text)
+
+async def mq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看 AgentMQ 状态"""
+    if not await check_auth(update):
+        return
+
+    if not AGENT_MQ_AVAILABLE:
+        await update.message.reply_text("❌ AgentMQ 未安装")
+        return
+
+    stats = AGENT_MQ.get_stats()
+    queue_size = stats['queue_size']
+
+    text = f"""📊 AgentMQ 状态：
+
+🤖 Agent: {stats['agent']}
+📬 队列消息: {queue_size} 条
+📝 日志数量: {stats['log_size']} 条
+🔗 Redis 连接: {'✅ 正常' if stats['redis_connected'] else '❌ 断开'}
+
+可用命令:
+/mq - 查看状态
+/mqcheck - 检查新消息
+/mqsend <agent> <主题> <内容> - 发送消息"""
+
+    await update.message.reply_text(text)
+
+async def mqcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """检查 AgentMQ 新消息"""
+    if not await check_auth(update):
+        return
+
+    if not AGENT_MQ_AVAILABLE:
+        await update.message.reply_text("❌ AgentMQ 未安装")
+        return
+
+    messages = AGENT_MQ.receive(count=10)
+
+    if not messages:
+        await update.message.reply_text("📭 没有新消息")
+        return
+
+    text = f"📬 收到 {len(messages)} 条消息:\n\n"
+
+    for msg in messages:
+        sender = msg.get('from', 'unknown')
+        subject = msg.get('subject', '无主题')
+        content = msg.get('content', '')[:100]
+        timestamp = msg.get('timestamp', '')[:19]
+
+        text += f"• 来自 {sender}: {subject}\n"
+        text += f"  {content}{'...' if len(msg.get('content', '')) > 100 else ''}\n"
+        text += f"  ⏰ {timestamp}\n\n"
+
+    await update.message.reply_text(text)
+
+async def mqsend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """发送 AgentMQ 消息"""
+    if not await check_auth(update):
+        return
+
+    if not AGENT_MQ_AVAILABLE:
+        await update.message.reply_text("❌ AgentMQ 未安装")
+        return
+
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text(
+            "📝 用法: /mqsend <agent> <主题> <内容>\n\n"
+            "示例: /mqsend hermes 任务分配 请处理用户请求"
+        )
+        return
+
+    target = args[0]
+    subject = args[1]
+    content = " ".join(args[2:])
+
+    try:
+        msg_id = AGENT_MQ.send_to(target, subject, content)
+        await update.message.reply_text(
+            f"✅ 消息已发送给 {target}\n\n"
+            f"📋 主题: {subject}\n"
+            f"📝 内容: {content[:100]}{'...' if len(content) > 100 else ''}\n"
+            f"🆔 ID: {msg_id[:8]}..."
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ 发送失败: {e}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理普通消息（流式输出版）"""
@@ -693,9 +805,16 @@ def main():
     print(f"📁 数据目录: {DATA_DIR}")
     print(f"⚙️ 上下文配置: {CONTEXT_CONFIG}")
 
-    # 创建 Application（配置代理）
+    # 创建 Application（配置代理和连接池）
     from telegram.request import HTTPXRequest
-    request = HTTPXRequest(proxy="http://127.0.0.1:7897")
+    request = HTTPXRequest(
+        proxy="http://127.0.0.1:7897",
+        connection_pool_size=20,
+        connect_timeout=30.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=60.0
+    )
     app = Application.builder().token(BOT_TOKEN).request(request).build()
 
     # 添加命令处理器
@@ -703,6 +822,9 @@ def main():
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("context", context_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("mq", mq_command))
+    app.add_handler(CommandHandler("mqcheck", mqcheck_command))
+    app.add_handler(CommandHandler("mqsend", mqsend_command))
 
     # 添加消息处理器
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -711,6 +833,62 @@ def main():
 
     # 添加错误处理器
     app.add_error_handler(error_handler)
+
+    # 设置 AgentMQ 定时检查（每 30 秒，首次延迟 60 秒）
+    if AGENT_MQ_AVAILABLE and AGENT_MQ is not None:
+        async def check_agent_mq(context: ContextTypes.DEFAULT_TYPE):
+            """定时检查 AgentMQ 消息"""
+            try:
+                messages = AGENT_MQ.receive(count=5)
+                if messages:
+                    print(f"📬 收到 {len(messages)} 条 AgentMQ 消息")
+
+                    for msg in messages:
+                        sender = msg.get('from', 'unknown')
+                        subject = msg.get('subject', '无主题')
+                        content = msg.get('content', '')
+                        timestamp = msg.get('timestamp', '')[:19]
+                        msg_id = msg.get('id', '')
+
+                        # 格式化消息
+                        text = f"📬 *AgentMQ 消息*\n\n"
+                        text += f"📤 来自: {sender}\n"
+                        text += f"📋 主题: {subject}\n"
+                        text += f"📝 内容: {content[:500]}{'...' if len(content) > 500 else ''}\n"
+                        text += f"⏰ 时间: {timestamp}"
+
+                        # 发送到 Telegram
+                        try:
+                            await context.bot.send_message(
+                                chat_id=ALLOWED_USER_ID,
+                                text=text,
+                                parse_mode="Markdown"
+                            )
+                            print(f"✅ 转发 AgentMQ 消息: {sender} -> {subject}")
+                        except Exception as e:
+                            print(f"❌ 转发消息失败: {e}")
+
+                        # 调用 Claude 处理并返回响应
+                        try:
+                            prompt = f"来自 {sender} 的消息：\n主题：{subject}\n内容：{content}\n\n请简洁回复。"
+                            response = call_claude(prompt, use_context=False)
+
+                            # 发送响应到 AgentMQ
+                            AGENT_MQ.send_to(
+                                sender,
+                                f"Re: {subject}",
+                                response[:1000],  # 限制长度
+                                metadata={"in_reply_to": msg_id}
+                            )
+                            print(f"✅ 已回复 {sender}: {response[:50]}...")
+                        except Exception as e:
+                            print(f"❌ 回复失败: {e}")
+            except Exception as e:
+                print(f"❌ AgentMQ 检查错误: {e}")
+
+        job_queue = app.job_queue
+        job_queue.run_repeating(check_agent_mq, interval=30, first=60)
+        print("🎧 AgentMQ 定时检查已启动（每 30 秒，首次延迟 60 秒）")
 
     # 启动轮询
     print("✅ Bot 已启动，等待消息...")
